@@ -175,6 +175,83 @@ func getPreferredModelOwners(modelNames []string, groups []string) map[string]st
 	return owners
 }
 
+// localVisionHintOverrides 是本地补丁：显式声明支持图片输入的模型（可自行增删）。
+// 之所以需要它：new-api 的 /v1/models 只回 OpenAI 的四个基础字段，客户端
+// （如 DSH）拿不到“这个模型能看图”的标记，就会把带图请求直接拦掉。
+var localVisionHintOverrides = map[string]bool{
+	"deepseek-v4.1-flash": true,
+}
+
+// modelSupportsVision 判断模型是否接受图片输入。
+// 顺序：显式覆盖表 → models 表里配的 tags → 模型名启发式。
+func modelSupportsVision(modelName string) bool {
+	if v, ok := localVisionHintOverrides[modelName]; ok {
+		return v
+	}
+	if model.DB != nil {
+		var tags string
+		row := model.DB.Table("models").Select("tags").
+			Where("model_name = ?", modelName).Limit(1).Row()
+		if row != nil {
+			_ = row.Scan(&tags)
+		}
+		if tags != "" {
+			low := strings.ToLower(tags)
+			for _, t := range []string{"vision", "multimodal", "image"} {
+				if strings.Contains(low, t) {
+					return true
+				}
+			}
+			for _, t := range []string{"text-only", "no-vision"} {
+				if strings.Contains(low, t) {
+					return false
+				}
+			}
+		}
+	}
+	low := strings.ToLower(modelName)
+	for _, hint := range []string{"vl", "vision", "omni", "multimodal", "gemini", "-4o"} {
+		if strings.Contains(low, hint) {
+			return true
+		}
+	}
+	return false
+}
+
+// fillModelCapabilities 给模型条目补上能力元数据。
+func fillModelCapabilities(oai *dto.OpenAIModels, modelName string) {
+	vision := modelSupportsVision(modelName)
+	inputs := []string{"text"}
+	modality := "text->text"
+	if vision {
+		inputs = []string{"text", "image"}
+		modality = "text+image->text"
+	}
+	outputs := []string{"text"}
+
+	oai.InputModalities = inputs
+	oai.OutputModalities = outputs
+	oai.Modalities = &dto.ModelModalities{Input: inputs, Output: outputs}
+	oai.Architecture = &dto.ModelArchitecture{
+		InputModalities:  inputs,
+		OutputModalities: outputs,
+		Modality:         modality,
+	}
+	oai.Capabilities = &dto.ModelCapabilities{
+		Vision:    vision,
+		ToolCalls: true,
+		Reasoning: true,
+	}
+	visionCopy := vision
+	oai.SupportsVision = &visionCopy
+	oai.SupportsImages = &visionCopy
+	oai.Vision = &visionCopy
+	oai.Multimodal = &visionCopy
+	yes := true
+	oai.SupportsToolCalls = &yes
+	oai.SupportsReasoning = &yes
+}
+
 func buildOpenAIModel(modelName string, ownerByModel map[string]string) dto.OpenAIModels {
 	var oaiModel dto.OpenAIModels
 	if staticModel, ok := openAIModelsMap[modelName]; ok {
@@ -191,6 +268,8 @@ func buildOpenAIModel(modelName string, ownerByModel map[string]string) dto.Open
 		oaiModel.OwnedBy = owner
 	}
 	oaiModel.SupportedEndpointTypes = model.GetModelSupportEndpointTypes(modelName)
+	// 本地补丁：补能力字段，客户端靠它决定能不能发图片
+	fillModelCapabilities(&oaiModel, modelName)
 	return oaiModel
 }
 
